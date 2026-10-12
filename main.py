@@ -75,7 +75,7 @@ async def handle_webhook(request: Request):
     tracking = payload.get("tracking", {})
     
     # Извлекаем gclid из utm_content или gclid
-    gclid = tracking.get("utm_content") or tracking.get("gclid")
+   gclid = tracking.get("utm_content") or tracking.get("utm_source") or tracking.get("gclid")
 
     if not gclid:
         questions = payload.get("questions_and_answers", [])
