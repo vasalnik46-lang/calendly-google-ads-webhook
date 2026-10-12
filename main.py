@@ -1,98 +1,106 @@
-from fastapi import FastAPI, Request
 import os
-import uvicorn
-from datetime import datetime, timezone
+import logging
+from fastapi import FastAPI, Request, HTTPException
+from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
 
-try:
-    from google.ads.googleads.client import GoogleAdsClient
-    from google.ads.googleads.errors import GoogleAdsException
-except ImportError:
-    GoogleAdsClient = None
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# Загрузка переменных окружения для Google Ads
+DEVELOPER_TOKEN = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN")
+CLIENT_ID = os.getenv("GOOGLE_ADS_CLIENT_ID")
+CLIENT_SECRET = os.getenv("GOOGLE_ADS_CLIENT_SECRET")
+REFRESH_TOKEN = os.getenv("GOOGLE_ADS_REFRESH_TOKEN")
 CUSTOMER_ID = os.getenv("GOOGLE_ADS_CUSTOMER_ID")
-CONVERSION_ACTION_ID = os.getenv("CONVERSION_ACTION_ID")
+CONVERSION_ACTION_ID = os.getenv("GOOGLE_ADS_CONVERSION_ACTION_ID")
+
 
 def get_google_ads_client():
-    """Инициализация клиента Google Ads из переменных окружения."""
+    """Создает клиент Google Ads API из переменных окружения."""
     credentials = {
-        "developer_token": os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-        "client_id": os.getenv("GOOGLE_ADS_CLIENT_ID"),
-        "client_secret": os.getenv("GOOGLE_ADS_CLIENT_SECRET"),
-        "refresh_token": os.getenv("GOOGLE_ADS_REFRESH_TOKEN"),
+        "developer_token": DEVELOPER_TOKEN,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": REFRESH_TOKEN,
+        "customer_id": CUSTOMER_ID,
         "use_proto_plus": True,
     }
-    customer_id = CUSTOMER_ID.replace("-", "") if CUSTOMER_ID else None
-    return GoogleAdsClient.load_from_dict(credentials), customer_id
+    return GoogleAdsClient.load_from_dict(credentials)
+
 
 def send_conversion_to_google_ads(gclid: str):
-    """Отправка офлайн-конверсии в Google Ads API."""
-    if not GoogleAdsClient:
-        print("❌ Ошибка: Библиотека google-ads не установлена.")
-        return
-
+    """Отправляет офлайн-конверсию в Google Ads по gclid."""
     try:
-        client, customer_id = get_google_ads_client()
+        client = get_google_ads_client()
         conversion_upload_service = client.get_service("ConversionUploadService")
         
         click_conversion = client.get_type("ClickConversion")
-        conversion_action_service = client.get_service("ConversionActionService")
-        
-        click_conversion.conversion_action = conversion_action_service.conversion_action_path(
-            customer_id, CONVERSION_ACTION_ID
+        click_conversion.conversion_action = (
+            f"customers/{CUSTOMER_ID}/conversionActions/{CONVERSION_ACTION_ID}"
         )
         click_conversion.gclid = gclid
-        click_conversion.conversion_date_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
-
+        
+        # Устанавливаем время конверсии (текущее в UTC в формате YYYY-MM-DD HH:MM:SS+00:00)
+        from datetime import datetime, timezone
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
+        click_conversion.conversion_date_time = now_str
+        
         request = client.get_type("UploadClickConversionsRequest")
-        request.customer_id = customer_id
-        request.conversions.append(click_conversion)
+        request.customer_id = CUSTOMER_ID
+        request.conversions = [click_conversion]
         request.partial_failure = True
-
+        
         response = conversion_upload_service.upload_click_conversions(request=request)
         
         if response.partial_failure_error:
-            print(f"⚠️ Google Ads API вернул предупреждение/ошибку: {response.partial_failure_error.message}")
+            logger.error(f"❌ Ошибка partial failure при отправке: {response.partial_failure_error.message}")
         else:
-            print(f"🚀 Конверсия с gclid={gclid} успешно отправлена в Google Ads!")
-
+            logger.info(f"✅ Конверсия для gclid {gclid} успешно отправлена в Google Ads!")
+            
     except GoogleAdsException as ex:
-        print(f"❌ Ошибка Google Ads API: {ex}")
+        logger.error(f"❌ Ошибка Google Ads API: {ex}")
     except Exception as e:
-        print(f"❌ Системная ошибка при отправке конверсии: {e}")
+        logger.error(f"❌ Системная ошибка при отправке конверсии: {e}")
+
 
 @app.get("/")
-def read_root():
-    return {"status": "ok", "message": "Calendly Google Ads Webhook Server is running"}
+async def root():
+    return {"status": "ok", "message": "Calendly to Google Ads Webhook Service is running"}
+
 
 @app.post("/webhook")
-async def handle_webhook(request: Request):
+async def receive_webhook(request: Request):
     data = await request.json()
-    print("Received webhook event:", data)
+    logger.info(f"Received webhook event: {data}")
+
+    # Проверяем тип события
+    event_type = data.get("event")
+    if event_type != "invitee.created":
+        return {"status": "ignored", "reason": f"Event {event_type} is not invitee.created"}
 
     payload = data.get("payload", {})
     tracking = payload.get("tracking", {})
     
-    # Извлекаем gclid из utm_content или gclid
-   gclid = tracking.get("utm_content") or tracking.get("gclid")
+    # Извлекаем gclid из tracking (utm_content или напрямую)
+    gclid = tracking.get("utm_content") or tracking.get("gclid")
 
+    # Вспомогательный поиск в вопросах и ответах, если tracking пуст
     if not gclid:
         questions = payload.get("questions_and_answers", [])
         for qa in questions:
             answer = qa.get("answer", "")
-            if answer and len(answer) > 10 and " " not in answer:
+            if answer and len(answer) > 5:
                 gclid = answer
                 break
 
     if gclid:
-        print(f"🎯 Найден gclid: {gclid}. Запускаем отправку в Google Ads...")
+        logger.info(f"🎯 Найден gclid: {gclid}. Запускаем отправку в Google Ads...")
         send_conversion_to_google_ads(gclid)
     else:
-        print("ℹ️ gclid не найден в tracking. Пропускаем отправку.")
+        logger.info("ℹ️ gclid не найден в tracking. Пропускаем отправку.")
 
     return {"status": "success"}
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
