@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# Google Ads configuration
 CLIENT_ID = os.getenv("GOOGLE_ADS_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_ADS_CLIENT_SECRET")
 REFRESH_TOKEN = (
@@ -31,10 +32,17 @@ VALIDATE_ONLY = (
     == "true"
 )
 
+# Google Analytics 4 configuration
+GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
+GA4_API_SECRET = os.getenv("GA4_API_SECRET")
+
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 INGEST_URL = "https://datamanager.googleapis.com/v1/events:ingest"
+GA4_MP_URL = "https://www.google-analytics.com/mp/collect"
 
 GCLID_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,}")
+GA4_CLIENT_ID_PATTERN = re.compile(r"\d+\.\d+")
+GA4_SESSION_ID_PATTERN = re.compile(r"\d+")
 
 
 def check_config():
@@ -53,10 +61,8 @@ def check_config():
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Missing environment variables: "
-                + ", ".join(missing)
-            ),
+            detail="Missing environment variables: "
+            + ", ".join(missing),
         )
 
     if not CUSTOMER_ID.isdigit():
@@ -69,16 +75,23 @@ def check_config():
 def get_access_token():
     check_config()
 
-    response = requests.post(
-        TOKEN_URL,
-        data={
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "refresh_token": REFRESH_TOKEN,
-            "grant_type": "refresh_token",
-        },
-        timeout=20,
-    )
+    try:
+        response = requests.post(
+            TOKEN_URL,
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "refresh_token": REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=20,
+        )
+    except requests.RequestException:
+        logger.error("Google OAuth request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Google OAuth",
+        )
 
     if not response.ok:
         logger.error(
@@ -90,7 +103,10 @@ def get_access_token():
             detail="Could not refresh Google OAuth token",
         )
 
-    token = response.json().get("access_token")
+    try:
+        token = response.json().get("access_token")
+    except ValueError:
+        token = None
 
     if not token:
         raise HTTPException(
@@ -102,11 +118,10 @@ def get_access_token():
 
 
 def parse_event_timestamp(value):
-    if not value:
-        return (
-            datetime.now(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
+    if not value or not isinstance(value, str):
+        raise HTTPException(
+            status_code=400,
+            detail="Calendly event timestamp is missing or invalid",
         )
 
     try:
@@ -128,6 +143,144 @@ def parse_event_timestamp(value):
             status_code=400,
             detail="Invalid Calendly event timestamp",
         )
+
+
+def timestamp_to_micros(value):
+    parsed = datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    )
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return str(int(parsed.timestamp() * 1_000_000))
+
+
+def parse_ga4_tracking(tracking):
+    """
+    Supported tracking.utm_content formats:
+
+    Legacy:
+        GCLID
+
+    Current:
+        GCLID~GA4_CLIENT_ID~GA4_SESSION_ID
+    """
+
+    gclid = ""
+    client_id = ""
+    session_id = ""
+
+    raw_gclid = tracking.get("gclid")
+
+    if (
+        isinstance(raw_gclid, str)
+        and GCLID_PATTERN.fullmatch(raw_gclid.strip())
+    ):
+        gclid = raw_gclid.strip()
+
+    raw_content = tracking.get("utm_content")
+    content = (
+        raw_content.strip()
+        if isinstance(raw_content, str)
+        else ""
+    )
+
+    if not gclid and GCLID_PATTERN.fullmatch(content):
+        gclid = content
+
+    parts = content.split("~")
+
+    if len(parts) == 3:
+        candidate_gclid, candidate_client_id, candidate_session_id = parts
+
+        if (
+            not gclid
+            and GCLID_PATTERN.fullmatch(candidate_gclid)
+        ):
+            gclid = candidate_gclid
+
+        if GA4_CLIENT_ID_PATTERN.fullmatch(candidate_client_id):
+            client_id = candidate_client_id
+
+        if GA4_SESSION_ID_PATTERN.fullmatch(candidate_session_id):
+            session_id = candidate_session_id
+
+    return gclid, client_id, session_id
+
+
+def send_booking_to_ga4(
+    client_id,
+    session_id,
+    transaction_id,
+    event_timestamp,
+):
+    if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
+        logger.error(
+            "GA4 event not sent: configuration is missing"
+        )
+        return {"status": "not_configured"}
+
+    if not GA4_CLIENT_ID_PATTERN.fullmatch(client_id):
+        return {
+            "status": "skipped",
+            "reason": "Missing or invalid GA4 client_id",
+        }
+
+    if not GA4_SESSION_ID_PATTERN.fullmatch(session_id):
+        return {
+            "status": "skipped",
+            "reason": "Missing or invalid GA4 session_id",
+        }
+
+    body = {
+        "client_id": client_id,
+        "timestamp_micros": timestamp_to_micros(event_timestamp),
+        "events": [
+            {
+                "name": "booking_completed",
+                "params": {
+                    "session_id": int(session_id),
+                    "engagement_time_msec": 1,
+                    "booking_id": transaction_id,
+                },
+            }
+        ],
+    }
+
+    try:
+        response = requests.post(
+            GA4_MP_URL,
+            params={
+                "measurement_id": GA4_MEASUREMENT_ID,
+                "api_secret": GA4_API_SECRET,
+            },
+            json=body,
+            timeout=20,
+        )
+    except requests.RequestException:
+        logger.error("GA4 Measurement Protocol request failed")
+        return {"status": "request_failed"}
+
+    if not response.ok:
+        logger.error(
+            "GA4 Measurement Protocol returned HTTP %s",
+            response.status_code,
+        )
+        return {
+            "status": "rejected",
+            "http_status": response.status_code,
+        }
+
+    logger.info(
+        "GA4 booking event request accepted; "
+        "event=booking_completed"
+    )
+
+    return {
+        "status": "sent",
+        "event": "booking_completed",
+    }
 
 
 def send_conversion_to_data_manager(
@@ -168,15 +321,22 @@ def send_conversion_to_data_manager(
         "validateOnly": VALIDATE_ONLY,
     }
 
-    response = requests.post(
-        INGEST_URL,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        json=body,
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            INGEST_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+    except requests.RequestException:
+        logger.error("Data Manager request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Google Data Manager API",
+        )
 
     if not response.ok:
         logger.error(
@@ -188,7 +348,10 @@ def send_conversion_to_data_manager(
             detail="Google Data Manager API rejected the event",
         )
 
-    result = response.json()
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
 
     logger.info(
         "Data Manager request accepted; validateOnly=%s; requestId=%s",
@@ -208,8 +371,11 @@ def send_conversion_to_data_manager(
 async def root():
     return {
         "status": "ok",
-        "message": "Calendly to Google Ads webhook is running",
+        "message": "Calendly to Google Ads and GA4 webhook is running",
         "validateOnly": VALIDATE_ONLY,
+        "ga4Configured": bool(
+            GA4_MEASUREMENT_ID and GA4_API_SECRET
+        ),
     }
 
 
@@ -244,9 +410,7 @@ async def receive_webhook(request: Request):
     payload = data.get("payload") or {}
 
     if not isinstance(payload, dict):
-        logger.warning(
-            "Calendly diagnostic: payload is not an object"
-        )
+        logger.warning("Calendly payload is not an object")
         return {
             "status": "ignored",
             "reason": "Invalid payload structure",
@@ -255,62 +419,24 @@ async def receive_webhook(request: Request):
     tracking = payload.get("tracking") or {}
 
     if not isinstance(tracking, dict):
-        logger.warning(
-            "Calendly diagnostic: tracking is not an object"
-        )
+        logger.warning("Calendly tracking is not an object")
         tracking = {}
 
-    # Не выводим значения идентификаторов или личные данные в логи.
-    gclid_value = tracking.get("gclid")
-    utm_content_value = tracking.get("utm_content")
-
-    utm_content = (
-        utm_content_value.strip()
-        if isinstance(utm_content_value, str)
-        else ""
-    )
-
     logger.info(
-        "Calendly diagnostic: payload_keys=%s; tracking_keys=%s; "
-        "gclid_present=%s; utm_content_present=%s",
+        "Calendly diagnostic: payload_keys=%s; tracking_keys=%s",
         sorted(str(key) for key in payload.keys()),
         sorted(str(key) for key in tracking.keys()),
-        bool(
-            isinstance(gclid_value, str)
-            and gclid_value.strip()
-        ),
-        bool(utm_content),
     )
+
+    gclid, client_id, session_id = parse_ga4_tracking(tracking)
 
     logger.info(
-        "Calendly UTM diagnostic: utm_content_length=%s; "
-        "matches_gclid_format=%s",
-        len(utm_content),
-        bool(GCLID_PATTERN.fullmatch(utm_content)),
+        "Tracking diagnostics: gclid_present=%s; "
+        "ga4_client_id_present=%s; ga4_session_id_present=%s",
+        bool(gclid),
+        bool(client_id),
+        bool(session_id),
     )
-
-    # Принимаем только GCLID из выделенных tracking-полей.
-    candidates = [gclid_value, utm_content_value]
-
-    gclid = next(
-        (
-            value.strip()
-            for value in candidates
-            if isinstance(value, str)
-            and GCLID_PATTERN.fullmatch(value.strip())
-        ),
-        "",
-    )
-
-    if not gclid:
-        logger.info(
-            "Calendly event ignored: no valid-looking GCLID "
-            "in tracking.gclid or tracking.utm_content"
-        )
-        return {
-            "status": "ignored",
-            "reason": "No valid-looking GCLID in tracking fields",
-        }
 
     event_timestamp = parse_event_timestamp(
         payload.get("created_at")
@@ -323,8 +449,37 @@ async def receive_webhook(request: Request):
         else ""
     )
 
-    return send_conversion_to_data_manager(
-        gclid=gclid,
-        event_timestamp=event_timestamp,
-        transaction_id=transaction_id,
-    )
+    results = {
+        "status": "processed",
+        "google_ads": {
+            "status": "skipped",
+            "reason": "No valid-looking GCLID",
+        },
+        "ga4": {
+            "status": "skipped",
+            "reason": "GA4 client_id/session_id not available",
+        },
+    }
+
+    if client_id and session_id:
+        results["ga4"] = send_booking_to_ga4(
+            client_id=client_id,
+            session_id=session_id,
+            transaction_id=transaction_id,
+            event_timestamp=event_timestamp,
+        )
+
+    if gclid:
+        results["google_ads"] = send_conversion_to_data_manager(
+            gclid=gclid,
+            event_timestamp=event_timestamp,
+            transaction_id=transaction_id,
+        )
+
+    if not gclid and not (client_id and session_id):
+        results["status"] = "ignored"
+        results["reason"] = (
+            "No valid GCLID or GA4 client/session identifiers"
+        )
+
+    return results
