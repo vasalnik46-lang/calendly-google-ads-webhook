@@ -179,7 +179,6 @@ def send_conversion_to_data_manager(
     )
 
     if not response.ok:
-        # Не записываем GCLID, токены или тело запроса в логи.
         logger.error(
             "Data Manager API returned HTTP %s",
             response.status_code,
@@ -245,7 +244,9 @@ async def receive_webhook(request: Request):
     payload = data.get("payload") or {}
 
     if not isinstance(payload, dict):
-        logger.warning("Calendly diagnostic: payload is not an object")
+        logger.warning(
+            "Calendly diagnostic: payload is not an object"
+        )
         return {
             "status": "ignored",
             "reason": "Invalid payload structure",
@@ -254,13 +255,20 @@ async def receive_webhook(request: Request):
     tracking = payload.get("tracking") or {}
 
     if not isinstance(tracking, dict):
-        logger.warning("Calendly diagnostic: tracking is not an object")
+        logger.warning(
+            "Calendly diagnostic: tracking is not an object"
+        )
         tracking = {}
 
-    # Логируем только названия полей и наличие значений.
-    # Значения GCLID и другие персональные данные не выводятся.
+    # Не выводим значения идентификаторов или личные данные в логи.
     gclid_value = tracking.get("gclid")
     utm_content_value = tracking.get("utm_content")
+
+    utm_content = (
+        utm_content_value.strip()
+        if isinstance(utm_content_value, str)
+        else ""
+    )
 
     logger.info(
         "Calendly diagnostic: payload_keys=%s; tracking_keys=%s; "
@@ -271,14 +279,19 @@ async def receive_webhook(request: Request):
             isinstance(gclid_value, str)
             and gclid_value.strip()
         ),
-        bool(
-            isinstance(utm_content_value, str)
-            and utm_content_value.strip()
-        ),
+        bool(utm_content),
     )
 
-    # Принимаем идентификатор только из выделенных tracking-полей.
+    logger.info(
+        "Calendly UTM diagnostic: utm_content_length=%s; "
+        "matches_gclid_format=%s",
+        len(utm_content),
+        bool(GCLID_PATTERN.fullmatch(utm_content)),
+    )
+
+    # Принимаем только GCLID из выделенных tracking-полей.
     candidates = [gclid_value, utm_content_value]
+
     gclid = next(
         (
             value.strip()
